@@ -9,6 +9,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Kanit:wght@500;600;700&family=Noto+Sans+Thai:wght@400;500;600&display=swap">
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <style>
 /* Layout: one narrow column, one screen per phase, boarding-pass card for the secret role. */
 :root{
@@ -123,6 +124,14 @@ table.roles tr.isspy td{color:var(--accent);font-weight:600}
 .rolewrap{display:flex;align-items:center;gap:14px}
 .rolewrap .role{min-width:0}
 .guessbox{width:100%;min-height:48px;padding:8px 12px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
+.code{font-family:var(--font-display);font-weight:700;font-size:56px;letter-spacing:.18em;text-align:center;line-height:1.1;padding-left:.18em}
+.plist{display:flex;flex-direction:column;gap:6px}
+.prow{display:flex;align-items:center;gap:10px;min-height:40px;padding:6px 10px;border-radius:10px;border:1px solid var(--line);background:var(--bg)}
+.prow .nmx{flex:1;min-width:0;overflow-wrap:anywhere}
+.tagx{font-size:12px;color:var(--muted);flex:none}
+.dotc{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--good);flex:none}
+.dotc.off{background:var(--line)}
+.toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:12px;max-width:calc(100% - 32px);z-index:50;text-align:center;font-size:14.5px}
 @media (prefers-reduced-motion:no-preference){.ticket.flip{animation:flip .55s ease-out}@keyframes flip{from{transform:perspective(600px) rotateY(-80deg);opacity:0}to{transform:none;opacity:1}}.clock.hot{animation:pulse 1s ease-in-out infinite}@keyframes pulse{50%{transform:scale(1.08)}}.ticket,.panel{animation:rise .25s ease-out}@keyframes rise{from{opacity:.0;transform:translateY(6px)}to{opacity:1;transform:none}}}
 </style>
 
@@ -458,6 +467,12 @@ function vSetup(){
     <div class="mark">${PLANE}<span>สกายฟอร์</span></div>
     <p>เกมจับสายลับ เล่นกัน 3–10 คน ใช้มือถือเครื่องเดียวส่งต่อกัน</p>
   </header>
+  <section class="panel">
+    <h2 class="label">เล่นออนไลน์</h2>
+    <p class="hint">ทุกคนใช้มือถือของตัวเอง สร้างห้องแล้วให้เพื่อนใส่รหัสเข้ามา</p>
+    <button class="btn primary block" data-on="home">เล่นออนไลน์</button>
+  </section>
+  <h2 class="label" style="margin-top:4px">หรือเล่นด้วยมือถือเครื่องเดียว</h2>
   <section class="panel" aria-labelledby="h-players">
     <div class="row between"><h2 id="h-players" class="label">จำนวนผู้เล่น</h2>
       <div class="stepper">
@@ -612,16 +627,19 @@ function vResult(){
 }
 
 function render(){
-  const v = { setup:vSetup, reveal:vReveal, play:vPlay, vote:vVote, guess:vGuess, result:vResult }[S.screen];
-  const same = render.last === S.screen && !(S.screen==="reveal");
+  const v = { setup:vSetup, reveal:vReveal, play:vPlay, vote:vVote, guess:vGuess, result:vResult, on:vOn }[S.screen];
+  const tag = S.screen==='on' ? 'on:'+O.phase+':'+O.cardStep+':'+O.peek+':'+O.guessing : S.screen;
+  const same = render.last === tag && !(S.screen==="reveal");
+  const ae = document.activeElement, aid = ae && ae.id, aval = ae && ae.value, asel = ae && ae.selectionStart;
   const grid = $app.querySelector(".locgrid");
   const gy = grid ? grid.scrollTop : 0, wy = window.scrollY;
   $app.innerHTML = v();
+  if (aid && $app.contains(ae)===false){ const ne=document.getElementById(aid); if (ne && ne.tagName==='INPUT'){ ne.value=aval; ne.focus(); try{ ne.setSelectionRange(asel,asel); }catch(err){} } }
   if (same){
     const ng = $app.querySelector(".locgrid"); if (ng) ng.scrollTop = gy;
     window.scrollTo(0, wy);
   } else window.scrollTo(0,0);
-  render.last = S.screen;
+  render.last = tag;
 }
 
 /* ---------- events ---------- */
@@ -672,6 +690,596 @@ document.addEventListener("click", e => {
     case "quit": if (g.running) pauseClock(); S.g=null; S.screen="setup"; try{ if(S.wake){S.wake.release();S.wake=null;} }catch(err){} render(); break;
   }
 });
+
+/* ================= online play: PeerJS, host-authoritative ================= */
+/* The room creator's phone runs the game and sends each player only their own card. */
+const ON_ID = "skyfall-", ON_ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const ICE = { config:{ iceServers:[{urls:"stun:stun.l.google.com:19302"},{urls:"stun:global.stun.twilio.com:3478"}] } };
+const onDefaults = () => ({ phase:"entry", role:null, code:"", peer:null, conn:null, me:-1, players:[],
+  settings:{ mins:8, cats:Object.keys(CATS) }, deal:null, struck:new Set(),
+  clock:{ running:false, endAt:0, left:0, lastSec:null, warn:"" }, readyN:0, readyTot:0,
+  vote:{ by:-1, timeup:false, sel:null, sent:false, voted:[] }, judge:{ text:"", sent:false },
+  result:null, err:"", cardStep:"hidden", peek:false, readUntil:0, guessing:false, guessText:"", leaving:false, wake:null, btnLabel:"" });
+const O = Object.assign({ name:"", joinCode:"" }, onDefaults());
+try { O.name = localStorage.getItem("skyfall-online-name") || ""; } catch(e) {}
+try { const q = new URLSearchParams(location.search).get("room"); if (q){ O.joinCode = q.toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,4); S.screen = "on"; } } catch(e) {}
+let H = null; /* host-only authoritative state */
+
+const cleanName = s => String(s||"").replace(/\s+/g," ").trim().slice(0,20);
+const cleanText = (s,n) => String(s||"").replace(/\s+/g," ").trim().slice(0,n);
+function toast(msg){ const d=document.createElement("div"); d.className="toast"; d.setAttribute("role","status"); d.textContent=msg; document.body.appendChild(d); setTimeout(()=>d.remove(),3200); }
+function onWake(on){
+  try {
+    if (on){ if (!O.wake && navigator.wakeLock) navigator.wakeLock.request("screen").then(w => { O.wake=w; }).catch(()=>{}); }
+    else if (O.wake){ O.wake.release(); O.wake=null; }
+  } catch(e) {}
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden && O.role && O.phase!=="entry") { O.wake=null; onWake(true); } });
+function getPid(code){
+  const k="skyfall-pid-"+code;
+  try { let p=sessionStorage.getItem(k); if(!p){ p="p"+Math.random().toString(36).slice(2,12); sessionStorage.setItem(k,p); } return p; }
+  catch(e){ return "p"+Math.random().toString(36).slice(2,12); }
+}
+function errText(err){
+  const t = err && err.type;
+  if (t==="peer-unavailable") return "ไม่พบห้องรหัสนี้ ตรวจรหัสอีกครั้ง และให้ผู้สร้างห้องเปิดหน้าเกมค้างไว้";
+  if (t==="network" || t==="server-error" || t==="socket-error" || t==="socket-closed") return "เชื่อมต่อเซิร์ฟเวอร์กลางไม่ได้ ตรวจอินเทอร์เน็ตแล้วลองใหม่";
+  return "เชื่อมต่อไม่สำเร็จ ("+(t||"unknown")+") ลองใหม่อีกครั้ง";
+}
+function onCleanup(){
+  O.leaving = true;
+  try { if (O.role==="host" && H) hostAll({t:"closed"}); } catch(e) {}
+  try { O.conn && O.conn.close(); } catch(e) {}
+  try { O.peer && O.peer.destroy(); } catch(e) {}
+  onWake(false); SFX.stopSay();
+  H = null;
+  const keep = { name:O.name, joinCode:O.joinCode };
+  Object.assign(O, onDefaults(), keep);
+}
+function onFail(msg){
+  try { O.conn && O.conn.close(); } catch(e) {}
+  try { O.peer && O.peer.destroy(); } catch(e) {}
+  H = null; const keep = { name:O.name, joinCode:O.joinCode };
+  Object.assign(O, onDefaults(), keep, { err:msg });
+  render();
+}
+
+/* ---------- transport ---------- */
+function toHost(msg){
+  if (O.role==="host") hostRecv(0,msg);
+  else { try { if (O.conn && O.conn.open) O.conn.send(msg); } catch(e) {} }
+}
+function hostSend(idx,msg){
+  if (idx===0) clientRecv(msg);
+  else { const p=H.players[idx]; if (p && p.conn && p.conn.open){ try { p.conn.send(msg); } catch(e) {} } }
+}
+function hostAll(msg){ for (let i=0;i<H.players.length;i++){ if (i===0 || H.players[i].connected) hostSend(i,msg); } }
+const connectedIdx = () => H.players.map((p,i)=>i).filter(i => i===0 || H.players[i].connected);
+
+/* ---------- create / join ---------- */
+function onCreate(){
+  const name = cleanName(O.name);
+  if (!name){ O.err="ใส่ชื่อของคุณก่อน"; render(); return; }
+  if (!window.Peer){ O.err="โหลดระบบออนไลน์ไม่สำเร็จ ตรวจอินเทอร์เน็ตแล้วรีเฟรชหน้านี้"; render(); return; }
+  try { localStorage.setItem("skyfall-online-name", name); } catch(e) {}
+  O.name = name; O.err=""; O.role="host"; O.phase="connecting"; O.leaving=false; render();
+  tryHost(0);
+}
+function genCode(){ let c=""; for (let i=0;i<4;i++) c += ON_ALPHA[rand(ON_ALPHA.length)]; return c; }
+function tryHost(n){
+  const code = genCode(); let peer, opened=false;
+  try { peer = new Peer(ON_ID+code, ICE); } catch(e){ onFail("เริ่มระบบออนไลน์ไม่สำเร็จ"); return; }
+  O.peer = peer;
+  const to = setTimeout(() => { if (!opened) onFail("เชื่อมต่อเซิร์ฟเวอร์กลางไม่ได้ ตรวจอินเทอร์เน็ตแล้วลองใหม่"); }, 15000);
+  peer.on("open", () => {
+    opened = true; clearTimeout(to);
+    H = { players:[{ pid:"host", name:O.name, conn:null, connected:true }], phase:"lobby", settings:{ mins:8, cats:Object.keys(CATS) },
+          deal:null, ready:new Set(), left:0, running:false, endAt:0, lastSync:0, votes:{}, voteTimeup:false, jvotes:{}, guess:"" };
+    O.code = code; O.me = 0; O.phase = "lobby"; onWake(true); sendLobby();
+  });
+  peer.on("connection", hostConn);
+  peer.on("disconnected", () => { try { peer.reconnect(); } catch(e) {} });
+  peer.on("error", err => {
+    if (!opened){
+      clearTimeout(to);
+      if (err && err.type==="unavailable-id" && n<5){ try { peer.destroy(); } catch(e) {} tryHost(n+1); }
+      else onFail(errText(err));
+    }
+  });
+}
+function onJoin(){
+  const name = cleanName(O.name), code = String(O.joinCode||"").toUpperCase().replace(/[^A-Z0-9]/g,"");
+  if (!name){ O.err="ใส่ชื่อของคุณก่อน"; render(); return; }
+  if (code.length!==4){ O.err="รหัสห้องมี 4 ตัวอักษร"; render(); return; }
+  if (!window.Peer){ O.err="โหลดระบบออนไลน์ไม่สำเร็จ ตรวจอินเทอร์เน็ตแล้วรีเฟรชหน้านี้"; render(); return; }
+  try { localStorage.setItem("skyfall-online-name", name); } catch(e) {}
+  O.name=name; O.joinCode=code; O.code=code; O.err=""; O.role="client"; O.phase="connecting"; O.leaving=false; render();
+  let peer; try { peer = new Peer(ICE); } catch(e){ onFail("เริ่มระบบออนไลน์ไม่สำเร็จ"); return; }
+  O.peer = peer; let done=false;
+  const to = setTimeout(() => { if (!done){ done=true; onFail("ติดต่อห้องไม่ได้ ตรวจรหัสห้องและอินเทอร์เน็ต แล้วลองใหม่"); } }, 15000);
+  peer.on("open", () => {
+    const conn = peer.connect(ON_ID+code, { reliable:true }); O.conn = conn;
+    conn.on("open", () => { conn.send({ t:"join", pid:getPid(code), name }); });
+    conn.on("data", d => {
+      if (!d || typeof d.t!=="string") return;
+      if (d.t==="joined" || d.t==="reject"){ done=true; clearTimeout(to); }
+      clientRecv(d);
+    });
+    conn.on("close", () => { if (!O.leaving && O.role==="client" && O.phase!=="entry" && O.phase!=="connecting") clientRecv({ t:"closed" }); });
+    conn.on("error", () => {});
+  });
+  peer.on("error", err => { if (!done){ done=true; clearTimeout(to); onFail(errText(err)); } });
+}
+
+/* ---------- host logic ---------- */
+function hostConn(conn){
+  const idxOf = () => H ? H.players.findIndex(p => p.conn===conn) : -1;
+  conn.on("data", d => {
+    if (!H || !d || typeof d.t!=="string") return;
+    if (d.t==="join") hostJoin(conn,d);
+    else { const i = idxOf(); if (i>0) hostRecv(i,d); }
+  });
+  conn.on("close", () => { const i = idxOf(); if (i>0) hostDrop(i); });
+  conn.on("error", () => {});
+}
+function hostJoin(conn,d){
+  const send = m => { try { conn.send(m); } catch(e) {} };
+  const pid = String(d.pid||"").slice(0,40);
+  let name = cleanName(d.name) || "ผู้เล่น";
+  const old = H.players.findIndex((p,i) => i>0 && p.pid===pid);
+  if (old>0){
+    const p = H.players[old];
+    if (p.conn && p.conn!==conn){ const oc=p.conn; p.conn=null; try { oc.close(); } catch(e) {} }
+    p.conn = conn; p.connected = true;
+    send({ t:"joined", idx:old, code:O.code }); sendLobby();
+    if (H.phase!=="lobby") sendSnapshot(old);
+    return;
+  }
+  if (H.phase!=="lobby"){ send({ t:"reject", reason:"started" }); setTimeout(() => { try { conn.close(); } catch(e) {} }, 400); return; }
+  if (H.players.length>=10){ send({ t:"reject", reason:"full" }); setTimeout(() => { try { conn.close(); } catch(e) {} }, 400); return; }
+  const base = name; let k = 2; while (H.players.some(p => p.name===name)) name = base+" ("+(k++)+")";
+  H.players.push({ pid, name, conn, connected:true });
+  send({ t:"joined", idx:H.players.length-1, code:O.code }); sendLobby();
+}
+function sendLobby(){
+  const players = H.players.map(p => ({ name:p.name, connected:p.connected }));
+  for (let i=0;i<H.players.length;i++){ if (i===0 || H.players[i].connected) hostSend(i,{ t:"lobby", me:i, players, settings:H.settings }); }
+}
+function hostDrop(i){
+  const p = H.players[i]; if (!p) return;
+  if (H.phase==="lobby"){ H.players.splice(i,1); sendLobby(); return; }
+  p.connected = false; p.conn = null; sendLobby();
+  if (H.phase==="card") hostCheckReady();
+  else if (H.phase==="vote") hostCheckVote();
+  else if (H.phase==="judge") hostCheckJudge();
+}
+function hostStart(){
+  H.players = H.players.filter((p,i) => i===0 || p.connected);
+  const n = H.players.length;
+  if (n<3){ toast("ต้องมีผู้เล่นอย่างน้อย 3 คน"); sendLobby(); return; }
+  const pool = LOCS.map((l,i)=>i).filter(i => H.settings.cats.includes(LOCS[i].cat));
+  if (!pool.length) return;
+  const locI = pool[rand(pool.length)], loc = LOCS[locI];
+  const roles = shuffle(loc.roles.slice().concat(FILLERS));
+  const spy = rand(n), assign = []; let k = 0;
+  for (let i=0;i<n;i++) assign.push(i===spy ? null : roles[k++]);
+  H.deal = { locI, spy, assign, pool, first:rand(n) };
+  H.phase = "card"; H.ready = new Set(); H.left = H.settings.mins*60; H.running = false; H.votes = {}; H.jvotes = {};
+  const names = H.players.map(p => p.name);
+  for (let i=0;i<n;i++) hostSend(i,{ t:"deal", me:i, spy:i===spy, locI:i===spy?null:locI, role:assign[i], pool, first:H.deal.first, mins:H.settings.mins, names });
+  sendLobby(); hostAll({ t:"rs", n:0, tot:connectedIdx().length });
+}
+function hostRecv(i,d){
+  if (!H) return;
+  switch(d.t){
+    case "start": if (i===0 && H.phase==="lobby") hostStart(); break;
+    case "settings":
+      if (i===0 && H.phase==="lobby"){
+        const mins = [5,8,10,15].includes(+d.mins) ? +d.mins : H.settings.mins;
+        const cats = Array.isArray(d.cats) ? d.cats.filter(c => CATS[c]) : H.settings.cats;
+        H.settings = { mins, cats: cats.length ? cats : H.settings.cats }; sendLobby();
+      }
+      break;
+    case "ready": if (H.phase==="card"){ H.ready.add(i); hostCheckReady(); } break;
+    case "callvote": if (H.phase==="play") hostStartVote(i,false); break;
+    case "vote":
+      if (H.phase==="vote" && Number.isInteger(d.target) && d.target>=0 && d.target<H.players.length && d.target!==i){
+        H.votes[i] = d.target; hostAll({ t:"vs", voted:Object.keys(H.votes).map(Number) }); hostCheckVote();
+      }
+      break;
+    case "guess":
+      if (H.phase==="play" && i===H.deal.spy){ const t = cleanText(d.text,60); if (t) hostStartJudge(t); }
+      break;
+    case "judge":
+      if (H.phase==="judge" && i!==H.deal.spy){ H.jvotes[i] = !!d.ok; hostCheckJudge(); }
+      break;
+    case "again": if (i===0 && H.phase==="result"){ H.phase="lobby"; H.players = H.players.filter((p,k)=>k===0||p.connected); hostAll({ t:"tolobby" }); sendLobby(); } break;
+  }
+}
+function hostCheckReady(){
+  if (H.phase!=="card") return;
+  const c = connectedIdx();
+  hostAll({ t:"rs", n:c.filter(i => H.ready.has(i)).length, tot:c.length });
+  if (c.every(i => H.ready.has(i))){
+    H.phase = "play"; H.running = true; H.endAt = Date.now()+H.left*1000; H.lastSync = Date.now();
+    hostAll({ t:"gostart", secs:H.left });
+  }
+}
+function hostPause(){ if (H.running){ H.left = Math.max(0, Math.ceil((H.endAt-Date.now())/1000)); H.running=false; } }
+function hostResume(){ H.running = true; H.endAt = Date.now()+H.left*1000; H.lastSync = Date.now(); }
+function hostStartVote(by,timeup){
+  hostPause(); H.phase="vote"; H.votes={}; H.voteTimeup = !!timeup || H.left===0;
+  hostAll({ t:"votestart", by, timeup:H.voteTimeup, secs:H.left });
+}
+function hostCheckVote(){
+  if (H.phase!=="vote") return;
+  const el = connectedIdx();
+  if (!el.every(i => H.votes[i]!==undefined)) return;
+  const cnt = {}; el.forEach(i => { const t=H.votes[i]; cnt[t]=(cnt[t]||0)+1; });
+  let top=-1, topN=0; Object.keys(cnt).forEach(t => { if (cnt[t]>topN){ topN=cnt[t]; top=+t; } });
+  if (topN > el.length/2){
+    const nm = H.players[top].name;
+    if (top===H.deal.spy) hostFinish("players", nm+" ถูกโหวต "+topN+" เสียง และเป็นสายลับจริงๆ");
+    else hostFinish("spy", nm+" ถูกโหวต "+topN+" เสียง แต่ไม่ใช่สายลับ สายลับรอดไปได้");
+  } else if (H.voteTimeup){
+    hostFinish("spy","หมดเวลาและโหวตไม่ลงตัว สายลับรอดไปได้");
+  } else {
+    H.phase="play"; hostResume(); hostAll({ t:"votefail", secs:H.left });
+  }
+}
+function hostStartJudge(text){
+  hostPause(); H.phase="judge"; H.jvotes={}; H.guess=text; hostAll({ t:"judgestart", text });
+}
+function hostCheckJudge(){
+  if (H.phase!=="judge") return;
+  const el = connectedIdx().filter(i => i!==H.deal.spy);
+  if (!el.length || !el.every(i => H.jvotes[i]!==undefined)) return;
+  const yes = el.filter(i => H.jvotes[i]).length, no = el.length-yes, loc = LOCS[H.deal.locI].name;
+  if (yes>no) hostFinish("spy","สายลับตอบว่า “"+H.guess+"” ผู้เล่นตัดสินว่าถูก ("+yes+" ต่อ "+no+") สถานที่จริงคือ "+loc);
+  else hostFinish("players","สายลับตอบว่า “"+H.guess+"” ผู้เล่นตัดสินว่าผิด ("+no+" ต่อ "+yes+") สถานที่จริงคือ "+loc);
+}
+function hostFinish(winner,reason){
+  H.phase="result"; hostPause();
+  hostAll({ t:"result", winner, reason, spy:H.deal.spy, locI:H.deal.locI, roles:H.deal.assign, names:H.players.map(p=>p.name) });
+}
+function sendSnapshot(i){
+  const d = H.deal; if (!d) return;
+  hostSend(i,{ t:"deal", me:i, spy:i===d.spy, locI:i===d.spy?null:d.locI, role:d.assign[i], pool:d.pool, first:d.first, mins:H.settings.mins, names:H.players.map(p=>p.name) });
+  const secs = H.running ? Math.max(0,Math.ceil((H.endAt-Date.now())/1000)) : H.left;
+  if (H.phase==="play" || H.phase==="vote" || H.phase==="judge")
+    hostSend(i,{ t:"snap", phase:H.phase, secs, running:H.running, timeup:H.voteTimeup, voted:Object.keys(H.votes).map(Number), text:H.guess });
+  else if (H.phase==="card") hostCheckReady();
+}
+setInterval(() => {
+  if (!H || H.phase!=="play" || !H.running) return;
+  const sec = Math.ceil((H.endAt-Date.now())/1000);
+  if (sec<=0){ H.left=0; H.running=false; hostStartVote(-1,true); }
+  else if (Date.now()-H.lastSync>5000){ H.lastSync=Date.now(); hostAll({ t:"clock", running:true, secs:sec }); }
+}, 500);
+
+/* ---------- client logic (the host runs this too, as player 0) ---------- */
+function setClock(secs,running){ const c=O.clock; c.left=secs; c.running=running; c.endAt=Date.now()+secs*1000; }
+function clientRecv(m){
+  let rerender = true;
+  switch(m.t){
+    case "joined": O.me=m.idx; O.code=m.code; O.phase="lobby"; onWake(true); break;
+    case "reject": {
+      const why = m.reason==="full" ? "ห้องเต็มแล้ว (สูงสุด 10 คน)" : "ห้องนี้เริ่มเกมไปแล้ว เข้าร่วมกลางเกมไม่ได้";
+      onFail(why); return;
+    }
+    case "lobby":
+      O.players=m.players; O.settings=m.settings; O.me=m.me;
+      if (O.phase==="connecting") O.phase="lobby";
+      break;
+    case "deal":
+      O.deal={ spy:m.spy, locI:m.locI, role:m.role, pool:m.pool, first:m.first, mins:m.mins };
+      O.me=m.me; O.players=m.names.map(n => ({ name:n, connected:true }));
+      O.struck=new Set(); O.phase="card"; O.cardStep="hidden"; O.peek=false; O.readUntil=0; O.guessing=false; O.result=null;
+      O.clock={ running:false, endAt:0, left:m.mins*60, lastSec:null, warn:"" }; O.readyN=0; O.readyTot=O.players.length;
+      break;
+    case "rs": O.readyN=m.n; O.readyTot=m.tot; break;
+    case "gostart": O.phase="play"; setClock(m.secs,true); O.clock.lastSec=m.secs; O.clock.warn=""; O.cardStep="done"; SFX.play("start"); onWake(true); break;
+    case "clock": setClock(m.secs,m.running); rerender=false; break;
+    case "votestart":
+      O.phase="vote"; O.peek=false; O.guessing=false; O.vote={ by:m.by, timeup:m.timeup, sel:null, sent:false, voted:[] };
+      setClock(m.secs,false); O.clock.warn=""; SFX.play("warn30"); break;
+    case "vs": O.vote.voted=m.voted; break;
+    case "votefail": O.phase="play"; setClock(m.secs,true); O.clock.lastSec=m.secs; toast("โหวตไม่ลงตัว เกมดำเนินต่อ"); break;
+    case "judgestart": O.phase="judge"; O.peek=false; O.guessing=false; O.judge={ text:m.text, sent:false }; setClock(O.clock.left,false); SFX.play("warn30"); break;
+    case "result": O.phase="result"; O.result=m; O.peek=false; O.clock.running=false; SFX.stopSay(); SFX.play(m.winner==="players"?"win":"lose"); break;
+    case "tolobby": O.phase="lobby"; O.result=null; O.deal=null; break;
+    case "snap":
+      setClock(m.secs,m.running); O.clock.lastSec=m.secs;
+      if (m.phase==="play"){ O.phase="play"; O.cardStep="done"; }
+      else if (m.phase==="vote"){ O.phase="vote"; O.vote={ by:-1, timeup:m.timeup, sel:null, sent:false, voted:m.voted||[] }; }
+      else if (m.phase==="judge"){ O.phase="judge"; O.judge={ text:m.text||"", sent:false }; }
+      break;
+    case "closed": O.phase="closed"; onWake(false); SFX.stopSay(); break;
+    default: rerender=false;
+  }
+  if (rerender && S.screen==="on") render();
+}
+
+/* ---------- views ---------- */
+const dotc = c => `<i class="dotc${c?"":" off"}"></i>`;
+function vOnEntry(){
+  return `
+  <header class="brand">
+    <div class="mark">${PLANE}<span>สกายฟอร์</span></div>
+    <p>เล่นออนไลน์ ทุกคนใช้มือถือของตัวเอง</p>
+  </header>
+  <section class="panel">
+    <label class="label" for="on-name">ชื่อของคุณ</label>
+    <input class="field" type="text" id="on-name" maxlength="20" placeholder="เช่น บีม" value="${esc(O.name)}" autocomplete="off">
+    <button class="btn primary block" data-on="create">สร้างห้องใหม่</button>
+    <p class="label" style="text-align:center">หรือเข้าห้องของเพื่อน</p>
+    <input class="field" type="text" id="on-code" maxlength="4" autocapitalize="characters" autocomplete="off" placeholder="รหัสห้อง 4 ตัวอักษร" value="${esc(O.joinCode)}">
+    <button class="btn block" data-on="join">เข้าห้อง</button>
+    ${O.err?`<div class="banner" role="alert">${esc(O.err)}</div>`:""}
+  </section>
+  <button class="btn ghost block" data-on="exit">กลับหน้าหลัก</button>`;
+}
+function vOnLobby(){
+  const host = O.role==="host", st = O.settings, conn = O.players.filter(p => p.connected).length;
+  const rows = O.players.map((p,i) => `<div class="prow">${dotc(p.connected)}<span class="nmx">${esc(p.name)}</span>${i===0?`<span class="tagx">ผู้สร้างห้อง</span>`:""}${i===O.me?`<span class="tagx">คุณ</span>`:""}</div>`).join("");
+  const link = location.origin + location.pathname + "?room=" + O.code;
+  const mins = [5,8,10,15].map(m => `<button class="chip" data-on="mins" data-v="${m}" aria-pressed="${st.mins===m}">${m} นาที</button>`).join("");
+  const cats = Object.entries(CATS).map(([k,v]) => `<button class="chip" data-on="cat" data-v="${k}" aria-pressed="${st.cats.includes(k)}">${v}</button>`).join("");
+  const pcount = LOCS.filter(l => st.cats.includes(l.cat)).length;
+  return `
+  <section class="panel">
+    <p class="label" style="text-align:center">รหัสห้อง</p>
+    <div class="code" aria-label="รหัสห้อง ${O.code.split("").join(" ")}">${esc(O.code)}</div>
+    <div class="row" style="justify-content:center"><button class="chip" data-on="copy">คัดลอกลิงก์ห้อง</button></div>
+    <p class="hint" style="text-align:center">ให้เพื่อนเปิดลิงก์เดียวกับเกมนี้ แล้วใส่รหัส หรือส่งลิงก์ห้องที่คัดลอกไปให้</p>
+    <p class="hint" style="text-align:center;word-break:break-all">${esc(link)}</p>
+  </section>
+  <section class="panel">
+    <div class="row between"><h2 class="label">ผู้เล่นในห้อง</h2><span class="hint">${conn} / 10 คน</span></div>
+    <div class="plist">${rows}</div>
+  </section>
+  ${host ? `
+  <section class="panel"><h2 class="label">เวลาในหนึ่งรอบ</h2><div class="chips">${mins}</div></section>
+  <section class="panel">
+    <div class="row between"><h2 class="label">หมวดสถานที่</h2><span class="hint">ใช้ ${pcount} แห่ง</span></div>
+    <div class="chips">${cats}</div>
+  </section>
+  <div>${soundBtn()}</div>
+  <button class="btn primary block" data-on="start" ${conn<3?"disabled":""}>${conn<3?"รอผู้เล่นอย่างน้อย 3 คน (ตอนนี้ "+conn+")":"เริ่มเกม"}</button>
+  <p class="hint" style="text-align:center">ผู้สร้างห้องต้องเปิดหน้านี้ค้างไว้ตลอดเกม อย่าล็อกหน้าจอหรือสลับแอป</p>`
+  : `
+  <section class="panel"><p>เวลาหนึ่งรอบ ${st.mins} นาที ใช้สถานที่ ${pcount} แห่ง</p><p class="hint">รอผู้สร้างห้องกดเริ่มเกม อย่าปิดหน้านี้</p></section>
+  <div>${soundBtn()}</div>`}
+  <button class="btn ghost danger block" data-on="exit">ออกจากห้อง</button>`;
+}
+function onTicket(){
+  const d=O.deal, nm=esc(O.players[O.me] ? O.players[O.me].name : "");
+  const loc = d.spy ? null : LOCS[d.locI];
+  const body = d.spy ? `
+      <div class="scene spy">${spyArt(0, null, "xMidYMin slice")}</div>
+      <div class="top"><span class="tag">บัตรขึ้นเครื่อง</span><span class="tag">${nm}</span></div>
+      <div class="stamp">สายลับ</div>
+      <div class="tear"></div>
+      <p class="role">คุณไม่รู้ว่าทุกคนอยู่ที่ไหน ฟังคำตอบของคนอื่นแล้วเดาสถานที่ให้ถูก อย่าให้ใครจับได้</p>`
+    : `
+      ${scene(loc)}
+      <div class="top"><span class="tag">บัตรขึ้นเครื่อง</span><span class="tag">${nm}</span></div>
+      <p class="label">สถานที่</p>
+      <div class="big">${esc(loc.name)}</div>
+      <div class="tear"></div>
+      <p class="label">บทบาทของคุณ</p>
+      <div class="rolewrap">${avatar(d.role, loc.name, 88)}<p class="role">${esc(d.role)}</p></div>`;
+  return `<section class="ticket flip">${body}</section>`;
+}
+function vOnCard(){
+  if (O.cardStep==="hidden") return `
+    <section class="panel pass">
+      <p class="label">ถึงเวลาดูบัตรของคุณ</p>
+      <div class="who">${esc(O.players[O.me] ? O.players[O.me].name : "")}</div>
+      <p class="hint">อย่าให้คนอื่นเห็นหน้าจอ</p>
+      <button class="btn primary block" data-on="show">แตะเพื่อดูบทบาทของฉัน</button>
+    </section>`;
+  if (O.cardStep==="waiting") return `
+    <section class="panel pass">
+      <p class="label">อ่านแล้ว</p>
+      <div class="who">รอเพื่อนอ่านบัตรให้ครบ</div>
+      <p class="hint">${O.readyN} / ${O.readyTot} คนพร้อมแล้ว เมื่อครบทุกคน เวลาจะเริ่มนับถอยหลัง</p>
+    </section>`;
+  const left = Math.max(0, O.readUntil-Date.now()), lbl = "อ่านแล้ว พร้อมเริ่ม"; O.btnLabel = lbl;
+  return `
+    ${onTicket()}
+    <div class="readbar" aria-hidden="true"><i id="readfill" style="width:${Math.min(100,100-left/READ_MS*100).toFixed(0)}%"></i></div>
+    <button class="btn primary block" id="hidebtn" data-on="hide" ${left>0?"disabled":""}>${left>0?"อ่านให้ครบก่อน ("+Math.ceil(left/1000)+")":lbl}</button>
+    <p class="readnote">${WARN_LINES[O.me%WARN_LINES.length]}</p>`;
+}
+function vOnPeek(){
+  O.btnLabel = "ซ่อนและกลับไปเล่น";
+  return `${onTicket()}<button class="btn primary block" id="hidebtn" data-on="hide">ซ่อนและกลับไปเล่น</button>`;
+}
+function vOnPlay(){
+  const c=O.clock, d=O.deal;
+  const sec = c.running ? Math.max(0,Math.ceil((c.endAt-Date.now())/1000)) : c.left;
+  const locs = d.pool.map(i => { const l=LOCS[i]; return `<button class="chip${O.struck.has(i)?" struck":""}" data-on="strike" data-v="${i}">${emoOf(l)} ${esc(l.name)}</button>`; }).join("");
+  const who = O.players.map((p,i) => `<span class="chip" style="cursor:default">${dotc(p.connected)} ${esc(p.name)}${i===O.me?" (คุณ)":""}</span>`).join("");
+  const guessBox = O.guessing ? `
+  <section class="panel">
+    <h2>เดาสถานที่</h2>
+    <p class="hint">พิมพ์สถานที่ที่คุณคิดว่าทุกคนอยู่ ไม่ต้องตรงเป๊ะ คนอื่นจะช่วยกันตัดสิน</p>
+    <input class="field" type="text" id="on-guess" maxlength="60" placeholder="เช่น สนามบิน" value="${esc(O.guessText)}" autocomplete="off">
+    <button class="btn primary block" data-on="sendguess">ส่งคำตอบ</button>
+    <button class="btn ghost block" data-on="cancelguess">ยกเลิก</button>
+  </section>` : `
+  <div class="row" style="flex-wrap:nowrap">
+    <button class="btn primary" style="flex:1" data-on="callvote">เรียกโหวตจับสายลับ</button>
+    <button class="btn" style="flex:1" data-on="guess">ฉันคือสายลับ เดาสถานที่</button>
+  </div>`;
+  return `
+  <section class="panel">
+    <p class="label" style="text-align:center">เวลาที่เหลือ</p>
+    <div id="clock" class="clock${sec<=30?" low":""}${sec<=10&&sec>0&&c.running?" hot":""}">${fmt(sec)}</div>
+    <p style="text-align:center">คนเริ่มถามก่อน: <strong>${esc(O.players[d.first] ? O.players[d.first].name : "")}</strong></p>
+    <div style="text-align:center">${soundBtn()}</div>
+    ${c.warn&&sec>0?`<div class="banner" role="status">${c.warn}</div>`:""}
+    ${sec===0?`<div class="banner" role="alert">หมดเวลาแล้ว กำลังเริ่มโหวตจับสายลับ</div>`:""}
+  </section>
+  ${guessBox}
+  <section class="panel">
+    <div class="row between"><h2 class="label">รายชื่อสถานที่</h2><span class="hint">แตะเพื่อขีดฆ่า</span></div>
+    <div class="chips locgrid">${locs}</div>
+  </section>
+  <section class="panel">
+    <h2 class="label">ผู้เล่นในห้อง</h2>
+    <div class="chips">${who}</div>
+    <button class="btn block" data-on="peek">ดูบัตรของฉันอีกครั้ง</button>
+  </section>
+  <button class="btn ghost danger block" data-on="exit">ออกจากห้อง</button>`;
+}
+function vOnVote(){
+  const v=O.vote, n=O.players.filter(p => p.connected).length;
+  const who = v.by>=0 && O.players[v.by] ? esc(O.players[v.by].name)+" เรียกโหวต" : "หมดเวลา ต้องโหวตจับสายลับ";
+  const chips = O.players.map((p,i) => i===O.me || !p.connected ? "" : `<button class="chip pick" data-on="pickv" data-v="${i}" aria-pressed="${v.sel===i}" ${v.sent?"disabled":""}>${esc(p.name)}</button>`).join("");
+  const done = O.players.filter((p,i) => v.voted.includes(i)).map(p => esc(p.name)).join(", ");
+  return `
+  <section class="panel">
+    <h2>โหวตจับสายลับ</h2>
+    <p class="hint">${who} ต้องได้เสียงมากกว่าครึ่งถึงจะนับ ถ้าไม่ลงตัวเกมจะเล่นต่อ</p>
+    <div class="chips">${chips}</div>
+  </section>
+  ${v.sent
+    ? `<section class="panel pass"><p class="label">ส่งโหวตแล้ว</p><p>รอคนอื่นโหวต (${v.voted.length} / ${n})</p>${done?`<p class="hint">โหวตแล้ว: ${done}</p>`:""}</section>`
+    : `<button class="btn primary block" data-on="sendvote" ${v.sel===null?"disabled":""}>${v.sel===null?"เลือกผู้ต้องสงสัยก่อน":"ยืนยันโหวต "+esc(O.players[v.sel].name)}</button>`}`;
+}
+function vOnJudge(){
+  const j=O.judge, d=O.deal;
+  if (d.spy) return `
+  <section class="panel pass">
+    <p class="label">คำตอบของคุณ</p>
+    <div class="verdict" style="overflow-wrap:anywhere">${esc(j.text)}</div>
+    <p class="hint">รอผู้เล่นคนอื่นตัดสินว่าถูกหรือผิด</p>
+  </section>`;
+  const loc = LOCS[d.locI];
+  return `
+  <section class="panel">
+    <h2>ช่วยกันตัดสิน</h2>
+    <p class="label">สายลับตอบว่า</p>
+    <div class="verdict" style="overflow-wrap:anywhere">${esc(j.text)}</div>
+    <p class="label">สถานที่จริง</p>
+    ${scene(loc)}
+    <div class="verdict">${esc(loc.name)}</div>
+    <p class="hint">ถ้าหมายถึงที่เดียวกันหรือใกล้เคียงมากถือว่าถูก ถ้าคะแนนเสมอถือว่าผิด</p>
+  </section>
+  ${j.sent
+    ? `<section class="panel pass"><p>ส่งคำตัดสินแล้ว รอคนอื่น</p></section>`
+    : `<div class="row" style="flex-wrap:nowrap"><button class="btn primary" style="flex:1" data-on="judgeyes">ตอบถูก</button><button class="btn" style="flex:1" data-on="judgeno">ตอบผิด</button></div>`}`;
+}
+function vOnResult(){
+  const r=O.result, loc=LOCS[r.locI];
+  const rows = r.names.map((nm,i) => `<tr class="${i===r.spy?"isspy":""}"><td class="avc">${i===r.spy?spyArt(40,"52 26 136 136"):avatar(r.roles[i], loc.name, 40)}</td><td class="nm">${esc(nm)}</td><td>${i===r.spy?"สายลับ":esc(r.roles[i])}</td></tr>`).join("");
+  return `
+  <section class="panel">
+    <p class="label">ผลการเล่น</p>
+    <div class="verdict ${r.winner==="spy"?"lose":"win"}">${r.winner==="spy"?"สายลับชนะ":"ฝ่ายธรรมดาชนะ"}</div>
+    <p>${esc(r.reason)}</p>
+  </section>
+  <section class="panel hasscene">
+    ${scene(loc)}
+    <p class="label">สถานที่จริง</p>
+    <div class="verdict">${esc(loc.name)}</div>
+    <p>สายลับคือ <strong>${esc(r.names[r.spy])}</strong></p>
+    <div style="overflow-x:auto"><table class="roles"><tbody>${rows}</tbody></table></div>
+  </section>
+  ${O.role==="host" ? `<button class="btn primary block" data-on="again">เล่นอีกรอบ ผู้เล่นชุดเดิม</button>` : `<p class="hint" style="text-align:center">รอผู้สร้างห้องเริ่มรอบใหม่</p>`}
+  <button class="btn ghost block" data-on="exit">ออกจากห้อง</button>`;
+}
+function vOn(){
+  switch(O.phase){
+    case "entry": return vOnEntry();
+    case "connecting": return `<section class="panel pass"><h2>กำลังเชื่อมต่อ</h2><p class="hint">ถ้านานเกิน 15 วินาที ระบบจะแจ้งให้ลองใหม่</p></section>`;
+    case "closed": return `<section class="panel pass"><h2>ห้องถูกปิด</h2><p class="hint">ผู้สร้างห้องออกไป หรือการเชื่อมต่อหลุด คุณกลับเข้าห้องเดิมได้ด้วยรหัสเดิมและชื่อเดิม ถ้าเกมยังไม่จบ</p><button class="btn primary block" data-on="exit">กลับหน้าหลัก</button></section>`;
+    case "lobby": return vOnLobby();
+    case "card": return vOnCard();
+    case "play": return O.peek ? vOnPeek() : vOnPlay();
+    case "vote": return vOnVote();
+    case "judge": return vOnJudge();
+    case "result": return vOnResult();
+  }
+  return "";
+}
+
+/* ---------- events ---------- */
+document.addEventListener("input", e => {
+  const t = e.target; if (!t || !t.id) return;
+  if (t.id==="on-name") O.name = t.value;
+  else if (t.id==="on-code") O.joinCode = t.value;
+  else if (t.id==="on-guess") O.guessText = t.value;
+});
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-on]"); if (!b || b.disabled) return;
+  SFX.init();
+  const a = b.dataset.on, v = b.dataset.v;
+  switch(a){
+    case "home": S.screen="on"; if (O.phase!=="entry" && !O.role) Object.assign(O, onDefaults(), { name:O.name, joinCode:O.joinCode }); render(); break;
+    case "exit": onCleanup(); S.screen="setup"; try { history.replaceState(null,"",location.pathname); } catch(err) {} render(); break;
+    case "create": onCreate(); break;
+    case "join": onJoin(); break;
+    case "copy": {
+      const link = location.origin + location.pathname + "?room=" + O.code;
+      let p; try { p = navigator.clipboard.writeText(link); } catch(err) { p = Promise.reject(err); }
+      p.then(() => toast("คัดลอกลิงก์ห้องแล้ว")).catch(() => toast("คัดลอกไม่ได้ กดค้างที่ลิงก์ด้านล่างเพื่อคัดลอก"));
+      break;
+    }
+    case "mins": if (H) toHost({ t:"settings", mins:+v, cats:H.settings.cats }); break;
+    case "cat": if (H){ const cs = H.settings.cats.slice(), k = cs.indexOf(v); if (k>=0){ if (cs.length>1) cs.splice(k,1); } else cs.push(v); toHost({ t:"settings", mins:H.settings.mins, cats:cs }); } break;
+    case "start": toHost({ t:"start" }); break;
+    case "show":
+      O.cardStep="shown"; O.readUntil=Date.now()+READ_MS; SFX.play("reveal");
+      { const li=O.me%WARN_LINES.length; setTimeout(() => { if (S.screen==="on" && O.phase==="card" && O.cardStep==="shown") SFX.say(WARN_LINES[li]); }, 600); }
+      render(); break;
+    case "hide":
+      if (O.readUntil && Date.now()<O.readUntil) break;
+      SFX.stopSay();
+      if (O.peek){ O.peek=false; render(); }
+      else { O.cardStep="waiting"; toHost({ t:"ready" }); render(); }
+      break;
+    case "peek": O.peek=true; O.readUntil=0; SFX.play("hide"); render(); break;
+    case "callvote": toHost({ t:"callvote" }); break;
+    case "guess": if (O.deal && O.deal.spy){ O.guessing=true; O.guessText=""; render(); } else toast("คุณไม่ใช่สายลับ"); break;
+    case "cancelguess": O.guessing=false; render(); break;
+    case "sendguess": { const t=cleanText(O.guessText,60); if (!t) { toast("พิมพ์คำตอบก่อน"); break; } O.guessing=false; toHost({ t:"guess", text:t }); break; }
+    case "strike": { const k=+v; O.struck.has(k)?O.struck.delete(k):O.struck.add(k); b.classList.toggle("struck"); break; }
+    case "pickv": O.vote.sel=+v; render(); break;
+    case "sendvote": if (O.vote.sel!==null){ O.vote.sent=true; toHost({ t:"vote", target:O.vote.sel }); render(); } break;
+    case "judgeyes": case "judgeno": O.judge.sent=true; toHost({ t:"judge", ok:a==="judgeyes" }); render(); break;
+    case "again": toHost({ t:"again" }); break;
+  }
+});
+
+/* reading lock and warnings for the online screens */
+setInterval(() => {
+  if (S.screen!=="on") return;
+  const b = document.getElementById("hidebtn");
+  if (b && (O.cardStep==="shown" || O.peek) && O.phase!=="result"){
+    const left = Math.max(0, O.readUntil-Date.now());
+    const f = document.getElementById("readfill"); if (f) f.style.width = Math.min(100,100-left/READ_MS*100)+"%";
+    if (left>0){ b.disabled=true; b.textContent="อ่านให้ครบก่อน ("+Math.ceil(left/1000)+")"; }
+    else if (b.disabled){ b.disabled=false; b.textContent=O.btnLabel; SFX.play("ready"); }
+  }
+  const c = O.clock;
+  if (O.phase!=="play" || !c.running) return;
+  const sec = Math.max(0, Math.ceil((c.endAt-Date.now())/1000));
+  const el = document.getElementById("clock");
+  if (el){ el.textContent=fmt(sec); el.classList.toggle("low",sec<=30); el.classList.toggle("hot",sec<=10&&sec>0); }
+  if (sec!==c.lastSec){
+    c.lastSec = sec;
+    if (sec===60){ c.warn="เหลือเวลา 1 นาทีสุดท้าย"; SFX.play("warn60"); render(); }
+    else if (sec===30){ c.warn="เหลือ 30 วินาที รีบตัดสินใจ"; SFX.play("warn30"); render(); }
+    else if (sec===10){ c.warn="10 วินาทีสุดท้าย"; SFX.play("tick"); render(); }
+    else if (sec<=5 && sec>0) SFX.play("tickhi");
+    else if (sec<10 && sec>0) SFX.play("tick");
+    else if (sec===0){ c.running=false; c.warn=""; SFX.play("end"); render(); }
+  }
+}, 250);
+
 
 /* ---------- forced reading time (same for everyone) ---------- */
 setInterval(() => {
